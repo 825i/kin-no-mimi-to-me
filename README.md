@@ -41,6 +41,10 @@ Other flags: `--no-subs` (condensed audio only), `--no-condensed` (subtitles onl
 
 If you'd rather type `jpsubs` than `python subgen.py`, symlink the launcher with `ln -s "$(pwd)/subgen" /usr/local/bin/jpsubs`, or use `jpsubs.cmd` on Windows.
 
+## Benchmarks
+
+On an M5 Mac it takes about 4.3 minutes per episode. Using CUDA/5090 it takes about 1.5 mins per episode.
+
 ## Contributions
 
 I'll accept decent PRs within reason when I have time to look over them.
