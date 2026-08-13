@@ -1,19 +1,22 @@
 # 金の耳と目 (Golden Ears and Eyes)
 
-Point it at your anime and it writes Japanese subtitles from what's actually being spoken, plus a "condensed audio" track of just the dialogue for listening practice.
+Use your existing library of Japanese TV or Anime to write Japanese subtitles from what's actually being spoken, plus a "condensed audio" track of just the dialogue for listening practice.
 
-It doesn't translate the existing subtitles. It uses their timing to find where each line is, then transcribes the Japanese audio itself with [anime-whisper](https://huggingface.co/litagin/anime-whisper). So the text matches the spoken words rather than an English translation.
+Everything happens locally on your own machine for 100% privacy. You do not need an AI subscription or to make any accounts.
 
-For every video you get two files, saved next to it:
+This does not translate existing subtitles. It only uses their timings to find where each line is, then transcribes the Japanese audio itself with [anime-whisper](https://huggingface.co/litagin/anime-whisper).
+This is so both the timings are perfect and the text matches the actual words spoken.
+
+For every video there are two files made:
 
 - `<episode>.ja.srt`, the Japanese subtitles.
 - `<series>/Condensed Audio/<name>.ogg`, the dialogue with silence, music and gaps cut out (made by impd) and tagged so it shows up properly in a music player.
 
-Give it one file or a whole library. It walks through every episode, skips anything it's already done, and keeps going if a file fails, so you can stop and restart whenever you like.
+Give it one file or a whole library. It works through every episode, skips anything it's already done, and keeps going if a file fails, so you can stop (CTRL+C) and restart whenever you like even over huge libraries.
 
 ## Using it
 
-You need Python 3.9+ and FFmpeg on your PATH. A GPU helps a lot but isn't required; it picks CUDA, then Apple's MPS, then the CPU.
+You need Python 3.9+ and FFmpeg on your PATH. A GPU helps a lot but isn't required; it picks CUDA, then Apple's MPS, then the CPU. I do not have an AMD GPU so I cannot build for that.
 
 Set it up:
 
@@ -37,6 +40,10 @@ python subgen.py --dry-run --batch "/path/to/Library"   # show what it would do 
 Other flags: `--no-subs` (condensed audio only), `--no-condensed` (subtitles only), `--quiet`.
 
 If you'd rather type `jpsubs` than `python subgen.py`, symlink the launcher with `ln -s "$(pwd)/subgen" /usr/local/bin/jpsubs`, or use `jpsubs.cmd` on Windows.
+
+## Contributions
+
+I'll accept decent PRs within reason when I have time to look over them.
 
 ## Credits
 
