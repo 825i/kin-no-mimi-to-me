@@ -1,172 +1,50 @@
-# 金の耳と目 — Golden Ears and Eyes
+# 金の耳と目 (Golden Ears and Eyes)
 
-*Japanese subtitles + condensed audio for immersion learning.*
+Point it at your anime and it writes Japanese subtitles from what's actually being spoken, plus a "condensed audio" track of just the dialogue for listening practice.
 
-A local, offline tool for **Japanese listening/reading immersion**. Point it at a video
-(or a whole library) and, for every episode, it produces two things off the **timing of an
-existing subtitle track**:
+It doesn't translate the existing subtitles. It uses their timing to find where each line is, then transcribes the Japanese audio itself with [anime-whisper](https://huggingface.co/litagin/anime-whisper). So the text matches the spoken words rather than an English translation.
 
-1. **Japanese subtitles** — transcribed from the **spoken audio** with
-   [anime-whisper](https://huggingface.co/litagin/anime-whisper), so the text matches what
-   is actually *said*, not a translation of the source subtitles. → `<episode>.ja.srt`
-2. **Condensed audio** — the dialogue segments cut out of the original audio and
-   concatenated into one small file (silence/music/gaps removed), with metadata so it shows
-   up nicely in music/audio players. → `<series>/Condensed Audio/<name>.ogg`
+For every video you get two files, saved next to it:
 
-The key idea: an existing subtitle track (any language — usually English) already marks
-*where* every line of dialogue is, with human-made, frame-accurate timing. We reuse those
-timestamps as the timing oracle, then transcribe the Japanese **audio** of each segment.
+- `<episode>.ja.srt`, the Japanese subtitles.
+- `<series>/Condensed Audio/<name>.ogg`, the dialogue with silence, music and gaps cut out (made by impd) and tagged so it shows up properly in a music player.
 
-> Why not just run Whisper on the whole file? Letting an ASR model find speech itself is
-> where hallucination and drift creep in (e.g. "ご視聴ありがとうございました" over silent
-> intros). Trusting real subtitle timings avoids that entirely — every segment we transcribe
-> is guaranteed to be dialogue.
+Give it one file or a whole library. It walks through every episode, skips anything it's already done, and keeps going if a file fails, so you can stop and restart whenever you like.
 
-## How it works
+## Using it
 
-```
-video ──▶ find subtitle track ──▶ segment timings ──┬─▶ cut+concat dialogue audio ─▶ <series>/Condensed Audio/<name>.ogg
-                                                     └─▶ anime-whisper per segment ─▶ <episode>.ja.srt
-```
+You need Python 3.9+ and FFmpeg on your PATH. A GPU helps a lot but isn't required; it picks CUDA, then Apple's MPS, then the CPU.
 
-Timing source, in priority order:
-1. **Embedded** subtitle track (prefers English, else the first text subtitle stream).
-2. **External** subtitle file with the same basename in the same folder (`.srt/.ass/.ssa/.vtt`).
-
-If a file has neither, it's skipped (see the optional pure-audio fallback below).
-
-## Requirements
-
-- **Python 3.9+**
-- **FFmpeg** on your `PATH` (`ffmpeg` + `ffprobe`) — separate, non-pip install: <https://ffmpeg.org/download.html>
-- Python packages from `requirements.txt` (PyTorch, Transformers, NumPy)
-- A GPU is optional but much faster. The model auto-selects **CUDA** (NVIDIA) → **MPS**
-  (Apple Silicon) → **CPU**.
-- **For condensed audio only:** the bundled [impd](vendor/impd) needs **Bash 5+** and GNU
-  tools. On macOS: `brew install bash grep findutils coreutils`. (Subtitle generation has
-  no such requirement.) Condensed audio is macOS/Linux only for now; subtitles are
-  cross-platform. If these are missing, the tool still makes subtitles and just skips the
-  condensed audio.
-
-## Install
+Set it up:
 
 ```bash
-# 1. clone, then create an isolated environment
 python3 -m venv .venv
-
-# 2. install Python deps
-#    macOS / Linux:
-.venv/bin/pip install -r requirements.txt
-#    Windows (PowerShell):
-#    .venv\Scripts\pip install -r requirements.txt
-
-# 3. install FFmpeg (if you don't have it)
-#    macOS:   brew install ffmpeg
-#    Debian:  sudo apt install ffmpeg
-#    Windows: winget install Gyan.FFmpeg   (or download from ffmpeg.org)
+.venv/bin/pip install -r requirements.txt      # Windows: .venv\Scripts\pip install -r requirements.txt
 ```
 
-The model (~3 GB) downloads automatically from Hugging Face on first run and is cached.
+Install FFmpeg if you don't have it (`brew install ffmpeg`, `apt install ffmpeg`, or `winget install Gyan.FFmpeg`). The anime-whisper model (about 3 GB) downloads itself the first time you run it.
 
-### Optional: a `jpsubs` shortcut
+The condensed audio is made by impd, which needs Bash 5 and a few GNU tools. On macOS that's `brew install bash grep findutils coreutils`. If you only want subtitles you can skip all that and pass `--no-condensed`; subtitle generation has no extra requirements.
 
-- **macOS / Linux:** the repo ships a `subgen` launcher. Symlink it onto your `PATH`:
-  ```bash
-  ln -s "$(pwd)/subgen" /usr/local/bin/jpsubs   # or ~/.local/bin, /opt/homebrew/bin, …
-  ```
-- **Windows:** use `jpsubs.cmd` (add the repo folder to your `PATH`, or call it directly).
-
-Everything below uses `jpsubs`; the equivalent without the shortcut is
-`python subgen.py …` (or `.venv/bin/python subgen.py …`).
-
-## Usage
+Then run it:
 
 ```bash
-# whole library (recurses into subfolders)
-jpsubs --batch "/path/to/Library"
-
-# a single file (or several)
-jpsubs "/path/to/Episode.mkv"
-
-# preview what it would do, without writing anything
-jpsubs --dry-run --batch "/path/to/Library"
+python subgen.py "/path/to/Episode.mkv"                 # one file
+python subgen.py --batch "/path/to/Library"             # a whole library
+python subgen.py --dry-run --batch "/path/to/Library"   # show what it would do first
 ```
 
-Options: `--dry-run`, `--no-subs` (condensed audio only), `--no-condensed` (subtitles only),
-`--quiet`. Batch mode **resumes** — it skips outputs that already exist — and continues past
-any file that fails.
+Other flags: `--no-subs` (condensed audio only), `--no-condensed` (subtitles only), `--quiet`.
 
-### Library layout
-
-`--batch` scans recursively and figures out the "series folder" for condensed audio,
-handling both common layouts:
-
-```
-Library/TV/Cowboy Bebop/Cowboy Bebop - 01.mkv        →  Cowboy Bebop/Condensed Audio/Cowboy Bebop - 01.ogg
-Library/Anime/Trigun/Episode 1/video.mkv             →  Trigun/Condensed Audio/Episode 1.ogg
-```
-
-Subtitles always land **next to the video** as `<episode filename>.ja.srt`. Condensed audio
-goes in a `Condensed Audio/` folder inside the **series** directory (a folder named like an
-episode — `Episode 1`, `E03`, `S01E05`, `01`, `Disc 1` — is treated as a per-episode folder,
-so the series is one level up).
-
-## Configuration
-
-Most settings are constants at the top of `subgen.py` (audio track, preferred subtitle
-language, denoise filter, condensed-audio codec/bitrate, folder name, etc.). Two things are
-overridable by environment variable so you never *have* to edit the code:
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `JPSUBS_MODEL` | Hugging Face model id | `litagin/anime-whisper` |
-| `JPSUBS_DEVICE` | Force `cuda` / `mps` / `cpu` | auto-detect |
-
-### Updating / swapping the model
-
-anime-whisper is referenced by its Hugging Face id, so updates are painless and can't break
-the script:
-
-- **Update to a newer revision** (if the author publishes one):
-  ```bash
-  .venv/bin/pip install -U "huggingface_hub[cli]"
-  hf download litagin/anime-whisper   # re-fetches the latest revision into the cache
-  ```
-- **Try a different model** without touching the code:
-  ```bash
-  JPSUBS_MODEL="some-org/some-other-whisper" jpsubs --batch "/path/to/Library"
-  ```
-
-## Optional: pure-audio fallback for files with no subtitles
-
-`generate_srt.sh` transcribes the spoken audio **without** a subtitle track (using
-[whisper.cpp](https://github.com/ggml-org/whisper.cpp) + `large-v3` and Silero VAD). It's a
-separate, optional helper — it needs whisper.cpp and the ggml models installed yourself, and
-is primarily tested on macOS/Linux. Use it only for content that has no subs to time against.
+If you'd rather type `jpsubs` than `python subgen.py`, symlink the launcher with `ln -s "$(pwd)/subgen" /usr/local/bin/jpsubs`, or use `jpsubs.cmd` on Windows.
 
 ## Credits
 
-This project stands on the work of others. Please respect their licenses.
+This is built on other people's work. Please respect their licenses.
 
-- **[anime-whisper](https://huggingface.co/litagin/anime-whisper)** by **litagin** — the
-  Japanese ASR model this tool runs (a Whisper fine-tune for anime/drama speech). *MIT.*
-- **[kotoba-whisper v2.0](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0)** by
-  **Kotoba Technologies** — anime-whisper's base model. *Apache-2.0.*
-- **[Whisper](https://github.com/openai/whisper)** by **OpenAI** — the underlying speech-
-  recognition architecture. *MIT.*
-- **[impd](https://github.com/Ajatt-Tools/impd)** by **Ren Tatsumoto / Ajatt-Tools** —
-  produces the condensed audio. impd is **vendored unmodified at [`vendor/impd`](vendor/impd)
-  and remains under its own license, GPL-3.0** (not relicensed; this project merely invokes
-  it as a separate program). Not affiliated with or endorsed by Ajatt-Tools.
-- **[Transformers](https://github.com/huggingface/transformers)** by **Hugging Face** — runs
-  the model. *Apache-2.0.*
-- **[PyTorch](https://github.com/pytorch/pytorch)** — the tensor/inference backend (incl.
-  CUDA and Apple MPS). *BSD-3-Clause.*
-- **[FFmpeg](https://ffmpeg.org)** — audio/video decoding, cutting and encoding, called as an
-  external program. *LGPL-2.1-or-later, or GPL if built with GPL components.* FFmpeg is a
-  trademark of Fabrice Bellard; this project is not affiliated with or endorsed by the FFmpeg
-  project.
+- [anime-whisper](https://huggingface.co/litagin/anime-whisper) by litagin does the transcription (MIT). It's built on [kotoba-whisper](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0) (Apache-2.0) and [OpenAI Whisper](https://github.com/openai/whisper) (MIT).
+- [impd](https://github.com/Ajatt-Tools/impd) by Ren Tatsumoto (Ajatt-Tools) makes the condensed audio. It's vendored unmodified in `vendor/impd` and stays under its own GPL-3.0 license. This project isn't affiliated with or endorsed by Ajatt-Tools.
+- [Transformers](https://github.com/huggingface/transformers) (Apache-2.0) and [PyTorch](https://github.com/pytorch/pytorch) (BSD-3-Clause) run the model.
+- [FFmpeg](https://ffmpeg.org) handles the audio (LGPL, or GPL depending on the build).
 
-## License
-
-[MIT](LICENSE) © 2026 825i.
+My own code is [MIT](LICENSE), © 2026 825i.
