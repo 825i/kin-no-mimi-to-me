@@ -1,0 +1,47 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Model weights / caches (downloaded on first run — never commit)
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ggml
+*.gguf
+
+# Generated outputs (per-user media, not part of the project)
+*.ja.srt
+*.condensed.ogg
+
+# Source / output media (never commit large media files)
+*.mp4
+*.mkv
+*.mov
+*.m4v
+*.avi
+*.ts
+*.webm
+*.ogg
+*.opus
+*.mp3
+*.m4a
+*.wav
+*.aac
+*.flac
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

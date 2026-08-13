@@ -1,0 +1,14 @@
+# Python dependencies. Install with:
+#     pip install -r requirements.txt
+#
+# You ALSO need FFmpeg on your PATH (ffmpeg + ffprobe) — that is a separate,
+# non-pip install. See https://ffmpeg.org/download.html
+#
+# Minimum versions are pinned loosely so future updates keep working. Known-good
+# as of writing: torch 2.x, transformers 4.4x. If a future transformers release
+# changes the ASR pipeline API, pin transformers to a version below the break.
+
+torch>=2.1
+transformers>=4.40
+accelerate>=0.26
+numpy>=1.24

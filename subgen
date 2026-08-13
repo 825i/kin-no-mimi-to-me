@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Launcher for the Japanese immersion tool (macOS / Linux).
+# Finds the repo directory even when invoked through a symlink, uses the project's
+# virtualenv if one exists, otherwise the system Python.
+set -euo pipefail
+
+# Resolve symlinks to locate the real script directory.
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in
+        /*) ;;                # already absolute
+        *) src="$dir/$src" ;; # relative symlink -> make absolute
+    esac
+done
+here="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+
+if [ -x "$here/.venv/bin/python" ]; then
+    PY="$here/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="$(command -v python3)"
+else
+    PY="$(command -v python)"
+fi
+
+exec "$PY" "$here/subgen.py" "$@"

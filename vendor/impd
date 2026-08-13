@@ -1,0 +1,1338 @@
+#!/usr/bin/env bash
+#
+# Immersion Pod - Passive listening management tool
+# Copyright (C) 2021-2026 Ajatt-Tools and contributors. https://github.com/Ajatt-Tools
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Any modifications to this file must keep this entire header intact.
+
+set -euo pipefail
+
+if [[ ${BASH_VERSION%%.*} -lt 5 ]]; then
+	echo "Bash version is older than 5. Exiting."
+	exit 1
+fi
+
+readonly program='immersionpod'
+readonly version=v0.10
+readonly current='current'
+readonly archive='archive'
+readonly config_filepath=${XDG_CONFIG_HOME:-$HOME/.config}/$program/config
+readonly tmp_dir="/tmp/$program"
+readonly srt_timing_pattern='^[0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} --> [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3}$'
+declare -a extract_audio_add_args=('-af' 'loudnorm=I=-16:TP=-1.5:LRA=11')
+
+# Keep a map with all file names already present in the impd directory
+# to prevent attempts to convert the same file twice.
+declare -A converted_map=()
+
+is_installed() {
+	[[ -x "$(command -v "$1")" ]]
+}
+
+_grep() {
+	# Run ggrep (GNU grep) from Homebrew if it is installed.
+	# https://formulae.brew.sh/formula/grep
+	# Note: on macOS without ggrep it has been suggested to use `grep -E` instead of `grep -P`.
+	if is_installed ggrep; then
+		ggrep "$@"
+	else
+		grep "$@"
+	fi
+}
+
+_find() {
+	# Run gfind (GNU find) from Homebrew (findutils) if it is installed.
+	# https://formulae.brew.sh/formula/findutils
+	if is_installed gfind; then
+		gfind "$@"
+	else
+		find "$@"
+	fi
+}
+
+_shuf() {
+	# Run gshuf (GNU shuf) from Homebrew (coreutils) if it is installed.
+	# https://formulae.brew.sh/formula/coreutils
+	if is_installed gshuf; then
+		gshuf "$@"
+	else
+		shuf "$@"
+	fi
+}
+
+fetch_ignored_chapters() {
+	# Print ignored chapters present in container, 1 chatper per line.
+	# Format: start_time,end_time
+	local -r video=${1:?}
+	local -r pattern=${2:?}
+
+	if ! is_installed ffprobe; then
+		echo "Error: ffprobe is not installed." >&2
+		return 1
+	fi
+
+	ffprobe \
+		-loglevel error \
+		-show_chapters \
+		-print_format csv=p=0 \
+		"$video" |
+	awk -F',' -vPATTERN="$pattern" '
+	{
+		start=$4
+		end=$6
+		title=$7
+		if (title ~ PATTERN) {
+			print start "," end
+		}
+	}'
+}
+
+filter_ignored_chapters() {
+    # filters the timestamps that overlap with the ignored chapters.
+	local -r chapters_file=${1:?}
+	if ! [[ -s $chapters_file ]]; then
+		cat -
+		return
+	fi
+
+	awk -F',' '
+	NR==FNR {
+		ignore_start[NR]=$1
+		ignore_end[NR]=$2
+		count=NR
+		next
+	}
+	{
+		start=$1
+		end=$2
+		for (i=1; i<=count; i++) {
+			if (start < ignore_end[i] && end > ignore_start[i]) {
+				next
+			}
+		}
+		print
+	}
+	' "$chapters_file" -
+}
+
+probe_tracks() {
+	# Print tracks present in container, separated by tabs.
+	# Format: index,lang,title,type
+
+	local -r video_filepath=$1
+
+	if ! [[ -f $video_filepath ]]; then
+		echo "'$video_filepath' is not a file."
+		return 1
+	fi
+
+	if ! is_installed ffprobe; then
+		echo "Error: ffprobe is not installed." >&2
+		return 1
+	fi
+
+	# Note: ffmpeg doesn't honor the order of specification of the local section entries in the output.
+	# This may cause breakage when impd is used to extract audio from certain containers.
+	# Because of that there's a need to "sort" the entries with awk.
+
+	ffprobe \
+		-loglevel error \
+		-show_entries stream_tags=language,title:stream=index,codec_type \
+		-print_format default \
+		"$video_filepath" | awk '
+	BEGIN {
+		FS="="
+		OFS="\t"
+		IGNORECASE=1
+		shown_types["audio"] = 1
+		shown_types["subtitle"] = 1
+		shown_types["video"] = 1
+	}
+	$0 == "[STREAM]" {
+		track_index = "auto"
+		track_lang  = "unknown"
+		track_title = "unknown"
+		track_type  = "unknown"
+	}
+	$1 == "index" {
+		track_index = $2
+	}
+	$1 == "codec_type" {
+		track_type = $2
+	}
+	$1 == "TAG:title" {
+		track_title = $2
+	}
+	$1 == "TAG:language" {
+		track_lang = $2
+	}
+	$0 == "[/STREAM]" {
+		for (type in shown_types) {
+			if (type == track_type) {
+				print track_index, track_lang, track_title, track_type
+				break
+			}
+		}
+	}'
+}
+
+probe() {
+	if [[ -z $* ]]; then
+		echo "Usage: ${0##*/} probe FILE"
+		return 1
+	fi
+
+	local -r video=$1
+
+	if [[ -f $video ]]; then
+		probe_tracks "$video" | column -s $'\t' -t -N 'Index,Language,Title,Type'
+	else
+		echo "'$video' is not a file."
+	fi
+}
+
+filter_tracks() {
+	# Filters output from the probe_tracks() function.
+	# Input format: index,lang,title,type
+	# Params: $1 = track type ('s' or 'a')
+	awk "-vMATCH=^$1" -F '\t' '$4 ~ MATCH'
+}
+
+preferred_languages() {
+	local pref_langs=${langs,,}
+	echo "${pref_langs//,/$'\n'}"
+}
+
+guess_track_priority() {
+	# Sets some numeric weight for track. Used when sorting tracks.
+	local -r track_lang=${1,,}
+	local -r track_title=${2,,}
+	local weight=0
+
+	# impd wants to use full subtitle tracks and avoid other tracks if possible.
+	case $track_title in
+	*full*)
+		weight=100
+		;;
+	*song* | *sign* | *caption* | *comment* | *forced*)
+		weight=900
+		;;
+	*)
+		weight=500
+		;;
+	esac
+
+	# Penalize for language that is not listed as priority.
+	while IFS= read -r pref_lang; do
+		if [[ $track_lang == "$pref_lang" ]]; then
+			break
+		else
+			weight=$((weight + 10))
+		fi
+	done <<<"$(preferred_languages)"
+
+	# Try the same with title in case the container specifies languages there.
+	while IFS= read -r pref_lang; do
+		if [[ $track_title == *"$pref_lang"* ]]; then
+			break
+		else
+			weight=$((weight + 1))
+		fi
+	done <<<"$(preferred_languages)"
+
+	echo "$weight"
+}
+
+best_track() {
+	# Print track number of the best internal track.
+	local -r track_type=${1:?} video=${2:?}
+	local -r tracks=$(probe_tracks "$video" | filter_tracks "$track_type" | cut -f1-3)
+	local track_num track_lang track_title
+	if [[ -n $tracks ]]; then
+		# Note: on macOS `sort -s` works like `sort --stable`.
+		while IFS=$'\t' read -r track_num track_lang track_title; do
+			printf -- '%d\t%d\n' "$track_num" "$(guess_track_priority "$track_lang" "$track_title")"
+		done <<<"$tracks" | sort -s -g -k 2 -t $'\t' | cut -f1 | head -1
+	fi
+}
+
+find_recent_files() {
+	local -r sep=$([[ -n ${1-} ]] && echo 0)
+	# Search files that have been modified in the last N days
+	if ! [[ -d "$video_dir" ]]; then
+		echo "Error: $video_dir does not exist." >&2
+		return 1
+	fi
+	_find "$video_dir" \
+		-type f \
+		-mtime "-$recent_threshold" \
+		"-print$sep" || exit 1
+}
+
+find_outdated_audio() {
+	_find "$immersionpod_dir/$current" -maxdepth 1 -type f -mtime "+$recent_threshold" -print0 || exit 2
+}
+
+find_all_converted_files() {
+	_find "$immersionpod_dir" -type f -print0
+}
+
+fill_converted_map() {
+	# If the map is already filled, return early.
+	for _i in "${!converted_map[@]}"; do
+		# try to iterate all keys. return if there are some keys present.
+		return
+	done
+
+	while IFS= read -r -d $'\0' file_path; do
+		converted_map["${file_path##*/}"]="$file_path"
+	done < <(find_all_converted_files)
+	echo "There are ${#converted_map[@]} files in the impd directory."
+}
+
+fetch_title() {
+	if [[ -z $* ]]; then
+		echo "Usage: ${0##*/} fetch_title FILE"
+		return 1
+	fi
+
+	local name=${1:?"Path to video file is not set."}
+	name=${name##*/} # basename
+	local -r name=${name%.*} # remove extension
+
+	strip_garbage() {
+		sed -E \
+			-e 's,[_\.], ,g' \
+			-e 's,ADN, ,g' \
+			-e 's,web-dl|varyg|2.?0.?H.?264, ,gi' \
+			-e 's,fansub|vostfr|10bits|Blu.?Ray|BDRip|x26[45]|AAC|flac|\w+-Raws, ,gi' \
+			-e 's|[0-9]{3,4}[pP]||g' \
+			-e 's,^[ -]*,,' \
+			-e 's,[- ]*$,,' \
+			-e 's, +, ,g'
+	}
+	remove_brackets() {
+		sed -E \
+			-e 's,(\[|\()[^])]*(\]|\)),,g'
+	}
+	replace_brackets() {
+		sed -E \
+			-e 's,(\[|\]|\(|\)), ,g'
+	}
+	strip() {
+		sed -E \
+			-e 's,(^[ _-]*|[ _-]*$),,g'
+	}
+
+	# Try to remove all text in brackets.
+	# If it turns out to be too aggressive, replace brackets instead.
+	local title
+	title=$(  echo "$name" | remove_brackets | strip_garbage | strip  )
+	if [[ -z $title ]]; then
+		title=$(  echo "$name" | replace_brackets | strip_garbage | strip  )
+	fi
+	echo "$title"
+}
+
+fetch_episode_number() {
+	local -r file=${1:?}
+	{
+		# Start with a fallback value; later matches override it because tail keeps the last candidate.
+		echo 01
+
+		# Prefer explicit episode numbers enclosed in square brackets, such as "[12]".
+		_grep -Pio '\[\K\d+(?=\])' <<<"${file%.*}"
+
+		# Clean noisy filename fragments before looking for looser episode-number patterns.
+		# The sed expressions remove bracketed/parenthesized release tags, resolution markers,
+		# years, and version suffixes, then turn underscores into spaces for consistent separators.
+		# The following grep extracts 1-3 digit candidates after common episode markers or separators.
+		sed \
+			-Ee 's/(\[|\()[^])]*(\]|\))//g' \
+			-Ee 's/[0-9]{3,4}[pP]//g' \
+			-Ee 's/(19|20)[0-9]{2}//g' \
+			-Ee 's/v[.0-9-]{1,4}//g' \
+			-e 's/_/ /g' <<<"${file%.*}" |
+			_grep -Pio '(?<=[＃#. pe-])[[:digit:]]{1,3}\b'
+
+	} | tail -1
+}
+
+canonicalize() {
+	# alternative to calling 'readlink -f' but using only shell built-ins.
+	if [[ $1 == /* ]]; then
+		echo "$1"
+	elif [[ -n $1 ]]; then
+		echo "$PWD/$1"
+	else
+		echo ""
+	fi
+}
+
+extract_subtitles() {
+	local -r input=$(  canonicalize "${1:?Input path not set.}"  )
+	local -r output=$(  canonicalize "${2:?Output path not set.}"  )
+	local -r track_num=${3:-$(  best_track s "$input"  )}
+
+	echo "Extracting track #${track_num:-auto} (subtitles) from ${input##*/}..."
+	ffmpeg -nostdin \
+		-loglevel error \
+		-hide_banner \
+		-n \
+		-vn \
+		-an \
+		-i "$input" \
+		-map_metadata -1 \
+		-map "0:${track_num:-s:0}" \
+		-f "${output##*.}" \
+		"$output" &&
+		echo "$output has been written."
+}
+
+check_output() {
+	if [[ $output != *.ogg ]]; then
+		echo "Error: filename should end with '.ogg'" >&2
+		return 1
+	fi
+
+	fill_converted_map
+
+	local -r file_name=${output##*/}
+	local -r existing_path=${converted_map["$file_name"]:-}
+
+	if  [[ -z ${global_overwrite-} ]]; then
+		# don't overwrite existing files unless the user wants it.
+
+		if [[ -f $output ]]; then
+			echo "Warning: file '$output' already exists. Doing nothing." >&2
+			return 1
+		fi
+		if [[ -n $existing_path ]]; then
+			echo "Warning: file '$existing_path' already exists. Doing nothing." >&2
+			return 1
+		fi
+	fi
+
+	if [[ ! -w $(dirname -- "$output") ]]; then
+		echo "Error: Can't write file $output." >&2
+		return 1
+	fi
+}
+
+extract_audio() {
+	local -r input=$(  canonicalize "${1:?Input file not set.}"  )
+	local -r output=$(  canonicalize "${2:-$immersionpod_dir/$current/$(  make_output_basename "$input"  ).ogg}"  )
+	local -r track_num=${3:-$(  best_track a "$input"  )}
+
+	if ! check_output; then
+		return 1
+	fi
+
+	if [[ ! -r $input ]]; then
+		echo "Error: Can't read file $input." >&2
+		return 1
+	fi
+
+	if is_ogg_audio "$input"; then
+		echo "File ${input##*/} appears to be an ogg audio file. Copying as is."
+		cp -- "$input" "$output"
+		return
+	fi
+
+	echo "Extracting track #${track_num:-auto} (audio) from ${input##*/}..."
+	ffmpeg -nostdin \
+		-loglevel error \
+		-hide_banner \
+		"-${global_overwrite:-n}" \
+		-vn \
+		-sn \
+		-i "$input" \
+		-map_metadata -1 \
+		-map "0:${track_num:-a:0}" \
+		-ac 2 \
+		-ab "$bitrate" \
+		-vbr on \
+		-compression_level 10 \
+		-application voip \
+		-acodec libopus \
+		"${extract_audio_add_args[@]}" \
+		"$output" &&
+		echo "$output has been written."
+}
+
+filename_to_compatible() {
+	sed -E \
+		-e 's,[\ / " ` < > : | ? *], ,g' \
+		-e "s,', ,g" \
+		-e 's,^\s+,,' \
+		-e 's,\s+$,,' \
+		-e 's,\s+, ,g' <<< "${1:?Filename not set.}"
+}
+
+make_output_basename() {
+	local input="${1:?Filename not set.}"
+	input=${input##*/} # remove path components
+	input=${input%.*} # remove extension
+	filename_to_compatible "$input"
+}
+
+make_uncondensed() {
+	local -r input=${1:?}
+	local -r base=$(  make_output_basename "$input"  )
+	local -r job_dir=$(mktemp -d "$tmp_dir/make_uncondensed.job-XXXX")
+	local -r temp_audio=$job_dir/$base.ogg
+	local -r output=$immersionpod_dir/$current/$base.ogg
+
+	if ! check_output; then
+		return 1
+	fi
+
+	if extract_audio "$input" "$temp_audio" && add_metadata "$temp_audio" "$output"; then
+		rm -rf -- "$job_dir"
+	else
+		return 1
+	fi
+}
+
+make_chunk() {
+	local -r input=${1:?}
+	local -r output=${2:?}
+	local -r start=${3:?}
+	local -r end=${4:?}
+
+	ffmpeg -nostdin \
+		-loglevel error \
+		-hide_banner \
+		-n \
+		-vn \
+		-sn \
+		-i "$input" \
+		-map_metadata -1 \
+		-codec:a copy \
+		-ss "$start" \
+		-to "$end" \
+		"$output"
+}
+
+find_external_subtitles() {
+	if [[ -z $* ]]; then
+		echo "Usage: ${0##*/} find_external_subtitles FILE" >&2
+		return 1
+	fi
+
+	local video=""
+	video=$(  canonicalize "${1:?Video path not set.}"  ) # convert to full path
+	local -r dir=${video%/*} # remove last component
+	video=${video##*/} # basename
+	local -r video=${video%.*} # remove extension
+
+	if [[ -z $dir ]] || [[ ! -d $dir ]]; then
+		echo "Error: video directory '$dir' is invalid." >&2
+		return 1
+	fi
+
+	_find "$dir" \
+		-maxdepth 5 \
+		-type f \
+		-regextype posix-extended \
+		-iregex '.*\.(ass|srt)$' \
+		-print0 |
+		_grep -Fiz --max-count=1 "$video" |
+		tr '\0' '\n' # fix no newline at the end
+}
+
+sub_conv() {
+	local -r input=${1:?Input file is not specified.}
+	local -r output=${2:?Output file is not specified.}
+
+	if [[ $output -ef "$input" ]]; then
+		echo "Input and output can't be the same file."
+		return 1
+	fi
+
+	if [[ $output != *.ass ]] && [[ $output != *.srt ]]; then
+		echo "Please specify ass or srt as the output extension."
+		return 1
+	fi
+
+	ffmpeg -nostdin \
+		-loglevel error \
+		-hide_banner \
+		-y \
+		-vn \
+		-an \
+		-i "$input" \
+		-f "${output##*.}" \
+		"$output"
+}
+
+parse_speech_fragments() {
+	# Note: The function incorrectly parses timestamps on certain locales on certain systems,
+	# such as sv_SE.UTF-8 on Tuxedo OS. Force the C locale to fix it.
+	LC_NUMERIC=C awk -F' --> ' -vPADDING="$padding" -vSRT_TIMING_PATTERN="$srt_timing_pattern" -vMAX_CHUNK_LEN_SECONDS="$max_chunk_len_seconds" '
+	function time_parts_to_seconds(hours, mins, secs) {
+		return hours * 3600.0 + mins * 60.0 + secs
+	}
+	function str_time_to_seconds(time,    chunks) {
+		split(time, chunks, ":")
+		gsub(",", ".", chunks[3])
+		return time_parts_to_seconds(chunks[1], chunks[2], chunks[3])
+	}
+	function overlap(t1s, t1e, t2s, t2e) {
+		return (min(t1e, t2e) - max(t1s, t2s)) / (t1e - t1s)
+	}
+	function min(var1, var2) {
+		if (var1 < var2) {
+			return var1
+		} else {
+			return var2
+		}
+	}
+	function max(var1, var2) {
+		if (var1 > var2) {
+			return var1
+		} else {
+			return var2
+		}
+	}
+	function apply_padding(timings) {
+		timings["start"] -= PADDING
+		timings["end"]   += PADDING
+		if (timings["start"] < 0) {
+			timings["start"] = 0
+		}
+	}
+	BEGIN {
+		prev["start"] = 0
+		prev["end"]   = 0
+	}
+	$0 ~ SRT_TIMING_PATTERN {
+		cur["start"] = str_time_to_seconds($1)
+		cur["end"]   = str_time_to_seconds($2)
+
+		if (cur["start"] == cur["end"] || (cur["end"] - cur["start"]) > MAX_CHUNK_LEN_SECONDS) {
+			next
+		}
+
+		apply_padding(cur)
+
+		if (prev["start"] == 0 && prev["end"] == 0) {
+			prev["start"] = cur["start"]
+			prev["end"]   = cur["end"]
+		} else {
+			if (overlap(prev["start"], prev["end"], cur["start"], cur["end"]) > 0) {
+				prev["start"] = min(prev["start"], cur["start"])
+				prev["end"]   = max(prev["end"], cur["end"])
+			} else {
+				print prev["start"]","prev["end"]
+				prev["start"] = cur["start"]
+				prev["end"]   = cur["end"]
+			}
+		}
+	}
+	END {
+		print prev["start"]","prev["end"]
+	}'
+}
+
+filter_non_speech_fragments() {
+	if [[ -z ${line_skip_pattern-} ]]; then
+		cat -
+		return
+	fi
+
+	awk -vSKIP_PATTERN="$line_skip_pattern" -vSRT_TIMING_PATTERN="$srt_timing_pattern" '
+	$0 ~ SRT_TIMING_PATTERN {
+		timings[timings_len++] = $0
+		skip = 0
+	}
+	$0 ~ SKIP_PATTERN {
+		if (skip == 0) {
+			skip = 1
+			--timings_len
+		}
+	}
+	END {
+		for (i = 0; i < timings_len; i++) {
+			print timings[i]
+		}
+	}'
+}
+
+fetch_video_subtitles() {
+	local -r video=${1:?}
+	local -r subs_ext=${2:-}
+	local -r subs_out=${3:?}
+	local -r track_num=${4-}
+
+	if [[ $prefer_internal_subs == 'yes' ]] && ! [[ ${forced_external_subs-} == 'yes' ]]; then
+		if [[ -f "$subs_out" ]] || extract_subtitles "$video" "$subs_out" "$track_num"; then
+			echo "Extracted internal subtitles."
+		else
+			echo "Failed to extract internal subtitles."
+			if [[ -f $subs_ext ]]; then
+				echo "External subtitle file '${subs_ext##*/}' will be used."
+				sub_conv "$subs_ext" "$subs_out"
+			else
+				return 1
+			fi
+		fi
+	else
+		if [[ -f $subs_ext ]]; then
+			echo "External subtitle file '${subs_ext##*/}' will be used."
+			sub_conv "$subs_ext" "$subs_out"
+		else
+			if [[ -f "$subs_out" ]] || extract_subtitles "$video" "$subs_out" "$track_num"; then
+				echo "Extracted internal subtitles."
+			else
+				echo "Failed to extract internal subtitles."
+				return 1
+			fi
+		fi
+	fi
+}
+
+add_metadata() {
+	local -r input=${1:?}
+	local -r output=${2:?}
+	local -r title=$(fetch_title "$input")
+
+	ffmpeg -nostdin \
+		-hide_banner \
+		-loglevel error \
+		-vn \
+		-sn \
+		-dn \
+		"-${global_overwrite:-n}" \
+		-i "$input" \
+		-c copy \
+		-map_metadata -1 \
+		-metadata title="$title" \
+		-metadata:s:a:0 title="$title" \
+		-metadata artist="impd" \
+		-metadata album="impd-$(date '+%Y-%V')" \
+		-metadata date="$(date '+%Y')" \
+		-metadata track="$(fetch_episode_number "$input")" \
+		"$output"
+}
+
+concat_audio() {
+	local -r chunks_file=$1 output=$2
+	ffmpeg -nostdin \
+		-hide_banner \
+		-loglevel error \
+		-vn \
+		-sn \
+		-y \
+		-f concat \
+		-safe 0 \
+		-i "$chunks_file" \
+		-map_metadata -1 \
+		-c copy \
+		"$output"
+}
+
+make_condensed() {
+	local -r video=$(  canonicalize "${1:?Video path not set.}"  ) # convert to full path
+	local -r base=$(  make_output_basename "$video"  )
+	local -r subs_external=$(  canonicalize "${3:-$(  find_external_subtitles "$video" || true  )}"  )
+
+	local -r job_dir=$(mktemp -d "$tmp_dir/$base.job-XXXX")
+
+	local -r temp_audio=$job_dir/$base.ogg
+	local -r output=$(  canonicalize "${2:-$immersionpod_dir/$current/$base.ogg}"  )
+
+	local -r chunks_dir=$(mktemp -d "$job_dir/chunks-XXXX")
+	local -r chunks_file=$job_dir/chunks.list
+
+	local -r subs_out=$job_dir/$base.srt
+
+	local -r subs_track_num=${4-}
+	local -r audio_track_num=${5-}
+
+	local -r ignored_chapters=${6-}
+	local -r ignored_chapters_file=$job_dir/ignored_chapters.list
+
+	_make_condensed() {
+		if ! check_output; then
+			return 1
+		fi
+
+		if [[ -n $subs_track_num ]] && ! [[ $subs_track_num =~ ^[0-9]+$ ]]; then
+			echo "Provided subtitle track number isn't a numeric value."
+			return 1
+		fi
+
+		if [[ -n $ignored_chapters ]] && ! fetch_ignored_chapters "$video" "$ignored_chapters" > "$ignored_chapters_file"; then
+			echo "Error while fetching ignored chapters."
+			return 1
+		fi
+
+		if [[ ! -f $temp_audio ]] && ! extract_audio "$video" "$temp_audio" "$audio_track_num"; then
+			return 1
+		fi
+
+		if ! fetch_video_subtitles "$video" "$subs_external" "$subs_out" "$subs_track_num"; then
+			echo "File '${temp_audio##*/}' will be added without condensing."
+			add_metadata "$temp_audio" "$output"
+			return
+		fi
+
+		local start end chunk_path
+		while IFS=, read -r start end; do
+			echo "Processing chunk from $start to $end..."
+			chunk_path=$chunks_dir/${base}_${start}-${end}.ogg
+			make_chunk "$temp_audio" "$chunk_path" "$start" "$end"
+			if [[ -f $chunk_path ]]; then
+				echo "file '$chunk_path'" >&3
+			fi
+		done < <(
+			filter_non_speech_fragments <"${subs_out:?}" |
+			parse_speech_fragments |
+			filter_ignored_chapters "$ignored_chapters_file"
+		) 3>"$chunks_file"
+
+		concat_audio "$chunks_file" "$temp_audio"
+		add_metadata "$temp_audio" "$output"
+	}
+
+	_cleanup() {
+		rm -rf -- "$job_dir"
+	}
+
+	if _make_condensed; then
+		_cleanup
+		return 0
+	else
+		_cleanup
+		return 1
+	fi
+}
+
+condense() {
+	if [[ -z $* ]]; then
+		echo -n "Usage: ${0##*/} condense "
+		echo -n "-i INPUT "
+		echo -n "-s [SUBTITLES FILE] "
+		echo -n "-o [OUTPUT FILE] "
+		echo -n "-t [SUBTITLE TRACK NUMBER] "
+		echo -n "-c [CHAPTER NAME REGEX] "
+		echo "-a [AUDIO TRACK NUMBER] "
+		return 1
+	fi
+	while getopts 'i: s: o: t: c: a:' flag; do
+		case $flag in
+		i)
+			local -r input=${OPTARG}
+			;;
+		s)
+			local -r subtitles=${OPTARG}
+			readonly forced_external_subs=yes
+			;;
+		o)
+			local -r output=${OPTARG}
+			;;
+		t)
+			local -r subs_track_num=${OPTARG}
+			;;
+		c)
+			local -r ignored_chapters=${OPTARG}
+			;;
+		a)
+			local -r audio_track_num=${OPTARG}
+			;;
+		*)
+			echo "Unknown argument." && exit 1
+			;;
+		esac
+	done
+	unset flag
+	make_condensed \
+		"${input:?Input video file is not set.}" \
+		"${output-}" \
+		"${subtitles-}" \
+		"${subs_track_num-}" \
+		"${audio_track_num-}" \
+		"${ignored_chapters-${ignored_chapters_pattern-}}" || true
+}
+
+notify_send() {
+	local -r msg=${*:?}
+	echo "$msg"
+	if is_installed notify-send; then
+		notify-send "Immersion pod" "$msg" &
+	fi
+}
+
+add_file() {
+	local -r source_file=$(  canonicalize "${1:?Source file not set.}"  )
+
+	if [[ -f $source_file ]]; then
+		if [[ -z ${global_no_condense-} ]]; then
+			make_condensed "$source_file"
+		else
+			make_uncondensed "$source_file"
+		fi
+	else
+		echo "File '$source_file' does not exist." >&2
+	fi
+}
+
+add_remote() {
+	local -r source_url=${1:?}
+	local -r job_dir=$(mktemp -d "$tmp_dir/download.job-XXXX")
+	(
+		cd -- "$job_dir" && curl -L -O "$source_url"
+		for file in "$job_dir"/*; do
+			add_file "$file" || true
+		done
+	)
+	rm -rf -- "$job_dir"
+}
+
+mime_type() {
+	file -b --mime-type -- "${1:?No file passed.}"
+}
+
+is_media() {
+	[[ $(mime_type "$1") =~ ^(video|audio)\/.+ ]] && [[ "$1" != *'.!qB' ]]
+}
+
+is_ogg_audio() {
+	[[ $(mime_type "$1") == audio/ogg ]]
+}
+
+add_notify() {
+	local -r source_file=${1:?}
+
+	if [[ -f $source_file ]] && is_media "$source_file"; then
+		local -r func=add_file
+	elif [[ $source_file == http*//* ]]; then
+		case $source_file in
+		*youtu*be* | *"/watch?v="*)
+			local -r func=add_yt
+			;;
+		*.mp3 | *.opus | *.ogg | *.wav | *.m4a | *.wma | *.mkv | *.mp4 | *.avi | *.flv | *.m4v | *.ts | *.webm)
+			local -r func=add_remote
+			;;
+		esac
+	fi
+
+	if [[ -z ${func-} ]]; then
+		echo "Error: '$source_file' is not a supported file type." >&2
+		return
+	fi
+
+	if "${func:?}" "$source_file"; then
+		notify_send "${source_file##*/} has been added."
+	fi
+}
+
+add() {
+	if [[ -z $* ]]; then
+		echo "Usage: ${0##*/} add [--recent] [--stdin] [FILE]"
+		return 1
+	fi
+	local -a file_list=()
+	while (($# > 0)); do
+		case $1 in
+		-r | --recent | recent)
+			local -r func=add_recent
+			;;
+		-s | --stdin | stdin)
+			local -r func=add_stdin
+			;;
+		--)
+			shift
+			file_list+=("$@")
+			break
+			;;
+		*)
+			file_list+=("$1")
+			;;
+		esac
+		shift
+	done
+	if [[ -n ${func-} ]]; then
+		"$func"
+	fi
+	for file in "${file_list[@]}"; do
+		add_notify "$file"
+	done
+}
+
+file_can_be_added() {
+	local -r file=$1
+	_grep -Pqv "$filename_skip_pattern" <<<"$file" && is_media "$file"
+}
+
+add_stdin() {
+	if [[ -n ${1-} ]]; then
+		local -r sep=$'\0'
+	else
+		local -r sep=$'\n'
+	fi
+	while IFS= read -r -d "$sep" file; do
+		if file_can_be_added "$file"; then
+			add_notify "$file"
+		fi
+	done
+}
+
+add_recent() {
+	find_recent_files -0 | add_stdin -0
+}
+
+recents() {
+	# alias for cli usage, e.g. `impd recents` will print candidates
+	# to be added to the immersionpod folder
+	find_recent_files -0 | while IFS= read -r -d $'\0' file; do
+		if file_can_be_added "$file"; then
+			echo "$file"
+		fi
+	done
+}
+
+download_yt() {
+	local -r ytdl=$(command -v yt-dlp || command -v youtube-dl)
+
+	if [[ -z $ytdl ]]; then
+		echo "Error: 'youtube-dl' or 'yt-dlp' is not installed." >&2
+		return 1
+	fi
+
+	"$ytdl" \
+		--ignore-errors \
+		--extract-audio \
+		--add-metadata \
+		--continue \
+		--no-mtime \
+		--write-subs \
+		--convert-subs srt \
+		-f bestaudio/best \
+		--geo-bypass \
+		"$@"
+}
+
+add_yt() {
+	local -r source_url=${1:?}
+	local -r job_dir=$(mktemp -d "$tmp_dir/youtube-dl.job-XXXX")
+
+	download_yt -o "$job_dir/%(uploader)s - %(title).60s.%(ext)s" "$source_url"
+
+	for file in "$job_dir"/*; do
+		if [[ $(mime_type "$file") == audio/* ]]; then
+			add_file "$file" || true
+		fi
+	done
+
+	rm -rf -- "$job_dir"
+}
+
+archive() {
+	local -r archive_fol="$immersionpod_dir/$archive/$(date '+%Y-%V')"
+	local -a old_episodes=()
+
+	echo "Archiving old episodes..."
+
+	while IFS= read -r -d $'\0' filename; do
+		old_episodes+=("$filename")
+	done < <(find_outdated_audio)
+
+	# if there are old episodes, crate a dir for them and then move them
+	if [[ ${#old_episodes[@]} -gt 0 ]]; then
+		mkdir -pv -- "$archive_fol"
+		mv -v -- "${old_episodes[@]}" "$archive_fol"
+		notify_send "Archived ${#old_episodes[@]} episodes."
+	else
+		notify_send "Nothing to archive."
+	fi
+}
+
+reshuffle() {
+	if ! is_installed mpc; then
+		echo "Error: mpc is not installed." >&2
+		return 1
+	fi
+	if ! pgrep -x mpd >/dev/null; then
+		echo "Error: mpd is not running." >&2
+		return 1
+	fi
+
+	mpc update "$program/$current"
+	mpc crop || true
+	mpc add "$program/$current"
+	mpc shuffle
+	if ! "${silent:-false}"; then
+		mpc play
+	fi
+}
+
+rotate() {
+	__help() {
+		echo "Usage: ${0##*/} rotate"
+		echo "OPTIONS:"
+		echo -e "  -h    show help"
+		echo -e "  -s    don't resume playback"
+	}
+
+	local flag="" help=false silent=false
+	while getopts 'h s' flag; do
+		case $flag in
+		h)
+			help=true
+			;;
+		s)
+			silent=true
+			;;
+		*)
+			echo "Unknown argument."
+			exit 1
+			;;
+		esac
+	done
+	unset flag
+
+	if "$help"; then
+		__help
+		return
+	fi
+
+
+	add_recent
+	archive
+	reshuffle
+}
+
+mkplaylist() {
+	local -r m3u_path=$immersionpod_dir/$current/impd.m3u
+
+	_find "$immersionpod_dir/$current" \
+		-type f \
+		\( -iname '*.mp3' -o -iname '*.opus' -o -iname '*.ogg' -o -iname '*.m4a' -o -iname '*.wav' -o -iname '*.wma' \) \
+		-printf '%P\n' |
+		_shuf > "$m3u_path"
+	echo "created file '$m3u_path'"
+}
+
+grep_mpd_dir() {
+	# https://wiki.archlinux.org/index.php/Music_Player_Daemon#Configuration
+	_grep -Pos 'music_directory\s*"?\K[^"]*(?="?)' -- ~/.config/mpd/mpd.conf 2>/dev/null
+}
+
+find_xdg_music_dir() {
+	# macOS doesn't have xdg-user-dir, so we'll use ~/Music as the default
+	if is_installed xdg-user-dir; then
+		xdg-user-dir MUSIC 2>/dev/null
+	else
+		echo "$HOME/Music"
+	fi
+}
+
+choose_mpd_dir() {
+	# Try to find the user's music directory.
+	# If "music_dir" is set in the config file, it takes precedence.
+	# Otherwise, the directory is set to the value from mpd's config.
+	# Different fallbacks are tried in other cases.
+	local dir
+	for dir in "$music_dir" "$(grep_mpd_dir)" "$(find_xdg_music_dir)" ~/Music ~/music; do
+		dir=${dir/\~/$HOME}
+		dir=${dir//\/\//\/}
+		dir=${dir%%/}
+		if [[ -n $dir ]] && [[ -d $dir ]]; then
+			echo "$dir"
+			return
+		fi
+	done
+}
+
+set_impd_dir() {
+	local dir
+	if ! [[ -d ${dir:=$(choose_mpd_dir)} ]]; then
+		echo "Couldn't detect the mpd directory."
+		exit 1
+	fi
+	readonly immersionpod_dir=$dir/$program
+}
+
+echo_help() {
+	local -r bn=${0##*/}
+
+	echo "Usage: $bn [OPTION] ACTION FILE"
+	echo
+	echo "Manage passive immersion. Create condensed audio."
+	echo
+	echo "Options:"
+	column -t -s'|' <<-EOF
+		  -f, --force|overwrite existing files
+		  -n, --no-condense|don't condense audio
+		  -t, --recent-threshold NUMBER|override the recent_threshold config option
+			  add [OPTION] FILE|add files to Immersion pod
+			  condense [OPTION]|condense a video
+			  archive|move episodes older than *recent_threshold* days to the archive folder
+			  reshuffle|re-add files to the playlist, shuffle them and start playing
+			  probe FILE|print streams in FILE
+			  rotate|same as calling $bn add -r, $bn archive, $bn reshuffle
+	EOF
+	echo
+	echo "Add options:"
+	column -t -s'|' <<-EOF
+		  -r, --recent|add new files from your video directory to Immersion pod
+		  -s, --stdin|read filenames from stdin
+	EOF
+	echo
+	echo "Condense options:"
+	column -t -s'|' <<-EOF
+		  -i|input file
+		  -o|optional output file
+		  -s|optional subtitle file
+		  -t|optional subtitle track number, if internal subtitles should be used
+		  -c|optional regex of chapter names, internal chapter names matching this will be ignored (e.g. OP|ED|Preview)
+		  -a|optional audio track number
+	EOF
+	echo
+	cat <<-EOF
+		Files:
+		  \$XDG_CONFIG_HOME/$program/config  User configuration file (usually ~/.config/$program/config).
+
+		Examples:
+	EOF
+	column -t -s'・' <<-EOF
+		  $bn add -f 'video.mkv'・force-add a file
+		  $bn rotate・rotate immersion files
+		  find /mnt/videos/ -type f | $bn add --stdin・add all files piped from stdin
+	EOF
+	cat <<-EOF
+
+		Full documentation https://github.com/Ajatt-Tools/impd
+		Report bugs to https://tatsumoto.neocities.org/blog/join-our-community
+	EOF
+}
+
+version() {
+	cat <<-EOF
+		${0##*/} $version
+		Copyright (C) 2021-2022 Ren Tatsumoto.
+		License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+		This is free software: you are free to change and redistribute it.
+		There is NO WARRANTY, to the extent permitted by law.
+	EOF
+}
+
+read_config_file() {
+	if [[ -f $config_filepath ]]; then
+		# shellcheck source=/dev/null
+		source -- <(_grep -xP '^[a-z_]+=.+$' -- "$config_filepath")
+	fi
+}
+
+set_config_defaults() {
+	readonly langs=${langs:-japanese,jpn,jp,ja,english,eng,en,russian,rus,ru}
+	readonly prefer_internal_subs=${prefer_internal_subs:-yes}
+	readonly max_chunk_len_seconds=${max_chunk_len_seconds:-30}
+	readonly video_dir=${video_dir:-~/Videos/ongoing}
+	readonly music_dir=${music_dir:-}
+	readonly bitrate=${bitrate:-32k}
+	readonly recent_threshold=${recent_threshold:-10}
+	readonly padding=${padding:-0.2}
+	readonly line_skip_pattern=${line_skip_pattern:-"^♬〜$|^♪?〜♪?$|^・～$|.*{\\be1}.*"}
+	readonly filename_skip_pattern=${filename_skip_pattern:-"NCOP|NCED"}
+	readonly ignored_chapters_pattern=${ignored_chapters_pattern:-"PV|OP|ED|Intro"}
+	readonly -a extract_audio_add_args
+}
+
+ensure_dirs() {
+	mkdir -p -- \
+		"${config_filepath%/*}" \
+		"$immersionpod_dir"/{$current,$archive} \
+		"$tmp_dir"
+}
+
+check_macos_tools() {
+	if [[ "$(uname)" != "Darwin" ]]; then
+		return
+	fi
+
+	# ggrep supports Perl-compatible regular expressions.
+	if ! is_installed ggrep; then
+		echo "ggrep is not installed. install it with brew: https://formulae.brew.sh/formula/grep" >&2
+		exit 1
+	fi
+
+	# gfind supports GNU find expressions.
+	if ! is_installed gfind; then
+		echo "gfind is not installed. install it with brew: https://formulae.brew.sh/formula/findutils" >&2
+		exit 1
+	fi
+
+	# gshuf supports playlist shuffling.
+	if ! is_installed gshuf; then
+		echo "gshuf is not installed. install it with brew: https://formulae.brew.sh/formula/coreutils" >&2
+		exit 1
+	fi
+}
+
+main() {
+	check_macos_tools
+	# Load configuration file, then apply settings omitted in the config file.
+	read_config_file
+
+	# Process global arguments
+	local -a opt_rest=()
+	while (($# > 0)); do
+		case $1 in
+		-n | --no-condense) readonly global_no_condense='y' ;;
+		-f | --force) readonly global_overwrite='y' ;;
+		-t | --recent-threshold)
+			# override recent threshold temporarily without editing the config file.
+			# this can be used to add more older files to immersionpod than normally.
+			recent_threshold=${2:-$recent_threshold}
+			shift
+			;;
+		*) opt_rest+=("$1") ;;
+		esac
+		shift
+	done
+	unset arg
+
+	# set config variables readonly. they can't be changed from this point onwards.
+	set_config_defaults
+	set_impd_dir
+	ensure_dirs
+
+	case ${opt_rest[*]} in
+	'' | -h | --help) echo_help ;;
+	-v | --version) version ;;
+	*)
+		local -r command=${opt_rest[0]}
+
+		if declare -f -- "$command" >/dev/null && [[ $command != "${FUNCNAME[0]}" ]]; then
+			# call arguments verbatim
+			"${opt_rest[@]}"
+		else
+			echo "Error: '$1' is not a known function name." >&2
+			echo_help
+			exit 1
+		fi
+		;;
+	esac
+}
+
+#
+# MAIN
+# Do not change anything here. If you want to modify the code, edit main()
+#
+main "$@"
