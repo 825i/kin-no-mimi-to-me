@@ -8,7 +8,9 @@ For each episode it uses an existing subtitle track's TIMESTAMPS as the timing o
   1. CONDENSED AUDIO — cuts the dialogue segments out of the original audio and
      concatenates them into one small file (silence/music/gaps removed), the way impd
      does, with metadata so it shows up properly in music/audio players. For listening
-     immersion.  ->  <series dir>/Condensed Audio/<name>.ogg
+     immersion.  ->  <Music>/<series>/Condensed Audio/<name>.ogg
+     It lands in your Music folder rather than the video library so that Jellyfin/Plex
+     do not index it as an episode or an extra. --condensed-dir puts it elsewhere.
   2. JAPANESE SUBTITLES — transcribes the AUDIO of each segment with anime-whisper, so
      the text matches what is actually spoken (never a translation of the source subs).
      ->  <episode filename>.ja.srt  (right next to the video)
@@ -25,9 +27,17 @@ Cross-platform: pure Python + ffmpeg. Runs on macOS, Linux and Windows. The mode
 the best available accelerator automatically — CUDA (NVIDIA) → MPS (Apple) → CPU.
 
 Environment overrides (so you never have to edit this file):
-  JPSUBS_MODEL   Hugging Face model id to use (default: litagin/anime-whisper).
-                 Point this at an updated/alternative model without touching the code.
-  JPSUBS_DEVICE  Force cuda | mps | cpu (default: auto-detect).
+  JPSUBS_MODEL      Hugging Face model id to use (default: litagin/anime-whisper).
+                    Point this at an updated/alternative model without touching the code.
+  JPSUBS_DEVICE     Force cuda | mps | cpu (default: auto-detect).
+  JPSUBS_CONDENSER  Force impd | native for condensed audio (default: auto — native on
+                    Windows, the vendored impd elsewhere).
+  JPSUBS_BASH       Path to a Bash 5 for impd, if it is somewhere unusual.
+  JPSUBS_AUDIO_LANG Comma-separated audio language tags to prefer when a file has more
+                    than one audio track (default: ja,jpn,jap,japanese).
+  JPSUBS_AUDIO_TRACK Force a specific audio stream (ffmpeg's 0:a:N) instead of choosing.
+  JPSUBS_COND_ROOT  Where condensed audio goes: <root>/<series>/Condensed Audio/
+                    (default: the user's Music folder). Same as --condensed-dir.
 
 Requirements: Python 3.9+, ffmpeg on PATH, and `pip install -r requirements.txt`.
 
@@ -37,6 +47,7 @@ Usage (via the `jpsubs` launcher, or `python subgen.py`):
 Options: --dry-run, --no-subs, --no-condensed, --quiet
 """
 import argparse
+import itertools
 import json
 import os
 import re
@@ -53,23 +64,62 @@ warnings.filterwarnings("ignore")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Windows stdio defaults to the legacy ANSI codepage (cp1252 on most installs), so the
+# very first transcribed Japanese line raises UnicodeEncodeError the moment output is
+# redirected to a file or a pipe. Force UTF-8 everywhere.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 # ---- Configuration (env-overridable where it matters) ----------------------
 MODEL_ID = os.environ.get("JPSUBS_MODEL", "litagin/anime-whisper")
-AUDIO_TRACK = 0                              # which audio stream to use (0 = first)
+
+
+def _int_env(name):
+    try:
+        return int(os.environ.get(name, "").strip())
+    except ValueError:
+        return None
+
+
+# Which audio stream to transcribe. None = choose automatically (see pick_audio_stream);
+# set JPSUBS_AUDIO_TRACK=N to force ffmpeg's 0:a:N when a release is mislabelled.
+AUDIO_TRACK = _int_env("JPSUBS_AUDIO_TRACK")
+AUDIO_LANG = os.environ.get("JPSUBS_AUDIO_LANG", "ja,jpn,jap,japanese")
 PREF_SUB_LANG = "en"                         # preferred embedded subtitle language
 DENOISE_FILTER = "afftdn=nr=12"              # light denoise for the ASR audio; "" to disable
-SEG_PAD_S = 0.20                             # ASR: audio padding each side of a segment
+SEG_PAD_S = 0.20                             # ASR: max audio padding each side of a segment
+TRAIL_GAP_SHARE = 0.25                       # of the gap to the next cue, how much the
+                                             # trailing pad may take (see clamp_pads):
+                                             # reaching forward is what makes a line end
+                                             # with the next sentence's first word
 MIN_SEG_S = 0.20                             # ignore sub segments shorter than this
 NO_REPEAT_NGRAM = 5                          # anime-whisper loop guard (per model card)
 SR = 16000                                   # ASR sample rate
 
 # Condensed audio is produced by the REAL impd (github.com/Ajatt-Tools/impd), vendored at
 # ./vendor/impd and invoked directly — no reimplementation. impd requires Bash 5+ and GNU
-# tools (macOS: `brew install bash grep findutils coreutils`). macOS/Linux only.
-COND_DIR = "Condensed Audio"                 # condensed files go in this folder in the series dir
+# tools (macOS: `brew install bash grep findutils coreutils`), so it is macOS/Linux only.
+# On Windows we use condense.py instead, a faithful port of impd's condense algorithm
+# (verified chunk-for-chunk against impd's own awk); see that file for why no Windows bash
+# — Git Bash/MSYS or WSL — can drive impd correctly.
+COND_DIR = "Condensed Audio"                 # the folder created under <root>/<series>/
 COND_FILE_EXT = ".ogg"
+# Where condensed audio is written: <COND_ROOT>/<series>/Condensed Audio/<name>.ogg.
+# Empty = the user's Music folder. Deliberately OUTSIDE the video library, because
+# Jellyfin and Plex will happily index a stray .ogg sitting next to the episodes and
+# present it as an extra, which it is not. --condensed-dir overrides it per run.
+COND_ROOT = os.environ.get("JPSUBS_COND_ROOT", "").strip()
 COND_BITRATE = "32k"                         # passed to impd's config; opus VBR is plenty for speech
 IMPD = Path(__file__).resolve().parent / "vendor" / "impd"
+# Run as a subprocess, never imported — condense.py is GPL-3.0 (a port of impd) and this
+# file is MIT. See the header of condense.py.
+CONDENSE_PY = Path(__file__).resolve().parent / "condense.py"
+# auto (default) | impd | native.  auto picks native on Windows, impd elsewhere when
+# Bash 5 and the vendored script are both present, native otherwise.
+CONDENSER = os.environ.get("JPSUBS_CONDENSER", "auto").strip().lower()
 
 SUB_SUFFIX = ".ja.srt"
 TEXT_SUB_CODECS = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text"}
@@ -85,6 +135,52 @@ VERBOSE = True
 def vprint(*a):
     if VERBOSE:
         print(*a, flush=True)
+
+
+# ---- Windows MAX_PATH ------------------------------------------------------
+# Unless LongPathsEnabled is turned on (it is off by default), Windows caps a path at 260
+# characters, 259 usable. Appending a staging suffix to an already-long output name is
+# enough to cross it: a perfectly legal 251-character .ogg becomes 260 with ".part.ogg"
+# and open() then fails with a bare "The system cannot find the path specified". So stage
+# under a SHORT fixed-length name in the same directory — same volume, so os.replace stays
+# atomic — instead of decorating the real name.
+WIN_PATH_LIMIT = 259
+_stage_counter = itertools.count()
+
+
+def staging_path(final) -> Path:
+    """A short-named sibling of `final` to write to before the atomic rename.
+
+    Sibling (not a temp dir) so the rename stays on one volume and therefore atomic.
+    Short, so it cannot push a legal path over MAX_PATH. Keeps the extension, because
+    ffmpeg picks its muxer from it. Dot-prefixed, so a leftover from a crashed run is
+    hidden on Unix, skipped by collect_videos, and can never be mistaken for an external
+    subtitle by find_external_sub — which a name like "<episode>.ja.srt.part.srt" could.
+    """
+    final = Path(final)
+    return final.parent / f".jpsubs-{os.getpid():x}-{next(_stage_counter):x}{final.suffix}"
+
+
+def path_too_long(p) -> bool:
+    return sys.platform == "win32" and len(str(Path(p).absolute())) > WIN_PATH_LIMIT
+
+
+def long_path_hint(p) -> str:
+    return (f"path is {len(str(Path(p).absolute()))} characters, over the "
+            f"{WIN_PATH_LIMIT}-character Windows limit:\n      {p}\n"
+            "    Either shorten the folder names, or enable long paths (admin, then "
+            "reboot):\n"
+            '      New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\'
+            'FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force')
+
+
+def tempdir(prefix):
+    """A TemporaryDirectory that tolerates Windows briefly holding a handle open on a
+    file an ffmpeg child just wrote (antivirus/indexer), which would otherwise turn a
+    successful run into a PermissionError during cleanup."""
+    if sys.version_info >= (3, 10):
+        return tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True)
+    return tempfile.TemporaryDirectory(prefix=prefix)
 
 
 # ---- Small helpers ---------------------------------------------------------
@@ -148,13 +244,79 @@ def series_dir_for(video: Path, root: Path) -> Path:
     return parent
 
 
+def _win_music_folder():
+    """Windows' real Music folder. Not %USERPROFILE%\\Music — OneDrive redirects it, so
+    ask the shell for the known folder instead of guessing."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+        # FOLDERID_Music {4BD8D571-6D19-48D3-BE97-422220080E43}
+        fid = GUID(0x4BD8D571, 0x6D19, 0x48D3,
+                   (ctypes.c_ubyte * 8)(0xBE, 0x97, 0x42, 0x22, 0x20, 0x08, 0x0E, 0x43))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(fid), 0, None, ctypes.byref(out)) == 0:
+            try:
+                return Path(out.value) if out.value else None
+            finally:
+                ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:
+        pass
+    return None
+
+
+def music_dir() -> Path:
+    """The user's Music folder, honouring Windows known-folder redirection and the XDG
+    user-dirs config on Linux. Falls back to ~/Music."""
+    if sys.platform == "win32":
+        p = _win_music_folder()
+        if p:
+            return p
+    elif sys.platform.startswith("linux"):
+        cfg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        try:
+            for line in (cfg / "user-dirs.dirs").read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                m = re.match(r'\s*XDG_MUSIC_DIR\s*=\s*"(.*)"\s*$', line)
+                if m:
+                    return Path(m.group(1).replace("$HOME", str(Path.home())))
+        except OSError:
+            pass
+    return Path.home() / "Music"
+
+
+def cond_root() -> Path:
+    return Path(COND_ROOT).expanduser() if COND_ROOT else music_dir()
+
+
+def _looks_like_season_folder(name: str) -> bool:
+    """'Season 1', 'S02', 'Series 3' — a subdivision of a show, not the show itself."""
+    return bool(re.fullmatch(r"(?i)(season|series|s)\s*\.?\s*\d{1,2}", name.strip()))
+
+
+def series_name_for(video: Path, root: Path) -> str:
+    """The show's name, for grouping output. Collapses 'Season N' folders onto their
+    parent so every season of a show lands in one place instead of a shared 'Season 1'."""
+    sdir = series_dir_for(video, root)
+    if _looks_like_season_folder(sdir.name) and sdir.parent.name:
+        return sdir.parent.name
+    return sdir.name
+
+
 def cond_output_for(video: Path, root: Path) -> Path:
-    """Condensed audio path: <series>/<COND_DIR>/<name>.ogg.
-    Uses the episode-folder name for per-episode layouts (more meaningful and avoids
-    collisions when inner files are generically named), else the video's own name."""
+    """Condensed audio path: <Music or COND_ROOT>/<series>/<COND_DIR>/<name>.ogg.
+
+    Written outside the video library on purpose (see COND_ROOT). Uses the episode-folder
+    name for per-episode layouts (more meaningful, and avoids collisions when the inner
+    files are generically named), else the video's own name."""
     sdir = series_dir_for(video, root)
     base = video.with_suffix("").name if video.parent == sdir else video.parent.name
-    return sdir / COND_DIR / (base + COND_FILE_EXT)
+    return cond_root() / series_name_for(video, root) / COND_DIR / (base + COND_FILE_EXT)
 
 
 # ---- Subtitle discovery ----------------------------------------------------
@@ -364,7 +526,7 @@ def gather_metadata(video: Path, root: Path):
     except json.JSONDecodeError:
         pass
     sdir = series_dir_for(video, root)
-    series = sdir.name
+    series = series_name_for(video, root)   # matches the output folder; 'Season 1' collapsed
     # episode label: the video name for flat layouts, the episode-folder name for nested
     base = video.with_suffix("").name if video.parent == sdir else video.parent.name
     meta = {
@@ -387,36 +549,140 @@ _BASH5 = "?"
 
 
 def find_bash5():
-    """Locate a Bash >= 5 (impd requires it). macOS system bash is 3.2; Homebrew provides 5."""
+    """Locate a Bash >= 5 (impd requires it). macOS system bash is 3.2; Homebrew provides 5.
+
+    Returns None on Windows unless JPSUBS_BASH forces a specific interpreter. Neither
+    Windows bash can actually drive impd: Git Bash/MSYS re-encodes argv to the ANSI
+    codepage (so Japanese filenames fail to open) and native ffmpeg cannot resolve the
+    POSIX paths impd writes into its concat list; WSL's bash sees a different filesystem
+    altogether. condense.py handles Windows instead.
+    """
     global _BASH5
-    if _BASH5 == "?":
-        _BASH5 = None
-        seen = []
-        for c in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash", shutil.which("bash"), "/bin/bash"):
-            if not c or c in seen or not os.path.exists(c):
-                continue
-            seen.append(c)
-            try:
-                v = subprocess.run([c, "-c", "echo ${BASH_VERSINFO[0]:-0}"], capture_output=True, text=True)
-                if v.stdout.strip().isdigit() and int(v.stdout.strip()) >= 5:
-                    _BASH5 = c
-                    break
-            except Exception:
-                pass
+    if _BASH5 != "?":
+        return _BASH5
+    _BASH5 = None
+    explicit = os.environ.get("JPSUBS_BASH", "").strip()
+    if not explicit and sys.platform == "win32":
+        return None
+    candidates = ([explicit] if explicit else
+                  ["/opt/homebrew/bin/bash", "/usr/local/bin/bash",
+                   shutil.which("bash"), "/bin/bash"])
+    seen = []
+    for c in candidates:
+        if not c or c in seen or not os.path.exists(c):
+            continue
+        seen.append(c)
+        try:
+            v = subprocess.run([c, "-c", "echo ${BASH_VERSINFO[0]:-0}"], capture_output=True, text=True)
+            if v.stdout.strip().isdigit() and int(v.stdout.strip()) >= 5:
+                _BASH5 = c
+                break
+        except Exception:
+            pass
     return _BASH5
 
 
+def which_condenser() -> str:
+    """Which condensed-audio backend to use: 'impd' or 'native'."""
+    if CONDENSER in ("impd", "native"):
+        return CONDENSER
+    if sys.platform == "win32":
+        return "native"
+    return "impd" if (find_bash5() and IMPD.exists()) else "native"
+
+
+def _tag_and_place(raw: Path, out_path: Path, meta: dict):
+    """Copy `raw` to `out_path` adding player metadata, by stream copy (no re-encode),
+    written atomically. Both condensers strip tags, so this is where they get set."""
+    tmp_out = staging_path(out_path)
+    tag = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
+           "-c", "copy", "-map_metadata", "-1"]
+    for k, v in meta.items():
+        if v:
+            tag += ["-metadata", f"{k}={v}"]
+    tag += [str(tmp_out)]
+    try:
+        cp = run(tag)
+    except BaseException:
+        tmp_out.unlink(missing_ok=True)
+        raise
+    if cp.returncode != 0:
+        tmp_out.unlink(missing_ok=True)
+        raise RuntimeError(f"tagging failed: {cp.stderr.strip()[:200]}")
+    os.replace(tmp_out, out_path)
+
+
 def make_condensed(video: Path, timing_srt: Path, out_path: Path, meta: dict):
+    """Make the condensed audio, then add player metadata.
+
+    Dispatches to the vendored impd on macOS/Linux and to the native Python port on
+    Windows. Both cut each dialogue line independently, so the result is clean — no
+    boundary stutter."""
+    backend = which_condenser()
+    if backend == "impd" and not (find_bash5() and IMPD.exists()):
+        if sys.platform == "win32":
+            vprint("    JPSUBS_CONDENSER=impd was requested, but impd cannot run on "
+                   "Windows — using the native condenser instead.")
+        else:
+            vprint("    impd unavailable (needs Bash 5 + GNU tools; macOS: "
+                   "brew install bash grep findutils coreutils) — using the native "
+                   "condenser instead.")
+        backend = "native"
+    if backend == "native":
+        return make_condensed_native(video, out_path, meta)
+    return make_condensed_impd(video, out_path, meta)
+
+
+def make_condensed_native(video: Path, out_path: Path, meta: dict):
+    """condense.py — impd's algorithm in pure Python + ffmpeg. Never writes full-length
+    audio in place of a condense; it fails instead.
+
+    condense.py is run as a SEPARATE PROGRAM, deliberately, and is never imported. It is a
+    port of impd and therefore GPL-3.0, while this file is MIT — invoking it at arm's
+    length is the same relationship this project already has with vendor/impd. Do not
+    replace this with `import condense`.
+    """
+    if not CONDENSE_PY.exists():
+        raise RuntimeError(f"condense.py is missing from {CONDENSE_PY.parent}")
+    with tempdir("subgen.cond.") as td:
+        tdp = Path(td)
+        raw, info_json = tdp / "cond.ogg", tdp / "info.json"
+        cmd = [sys.executable, str(CONDENSE_PY), str(video), "-o", str(raw),
+               "--bitrate", COND_BITRATE, "--json-out", str(info_json)]
+        if not VERBOSE:
+            cmd.append("--quiet")
+        # Stream its output line by line so per-chunk progress still appears live.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=dict(os.environ, PYTHONUTF8="1"))
+        tail = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            tail.append(line)
+            del tail[:-6]
+            vprint(line)
+        if proc.wait() != 0:
+            raise RuntimeError("condensing failed: " + " / ".join(tail)[-300:])
+        try:
+            info = json.loads(info_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = {}
+        _tag_and_place(raw, out_path, meta)
+    size_mb = out_path.stat().st_size / 1e6 if out_path.exists() else 0
+    extra = ""
+    if info.get("dialogue_s") is not None and info.get("source_s"):
+        extra = (f", {info['dialogue_s'] / 60:.1f} min of dialogue from "
+                 f"{info['source_s'] / 60:.1f} min")
+    vprint(f"    -> {out_path.name}  ({size_mb:.1f} MB{extra})")
+
+
+def make_condensed_impd(video: Path, out_path: Path, meta: dict):
     """Make the condensed audio with the REAL impd (vendored at ./vendor/impd), then add
-    player metadata (impd strips tags). impd cuts each dialogue line independently, so the
-    result is clean — no boundary stutter. Requires Bash 5+ and GNU tools; if they're
-    missing the condensed step is skipped (subtitles still work)."""
+    player metadata (impd strips tags). Requires Bash 5+ and GNU tools."""
     bash5 = find_bash5()
-    if bash5 is None or not IMPD.exists():
-        vprint("    Condensed audio skipped: needs Bash 5 + impd "
-               "(macOS: brew install bash grep findutils coreutils).")
-        return
-    with tempfile.TemporaryDirectory(prefix="subgen.impd.") as td:
+    with tempdir("subgen.impd.") as td:
         tdp = Path(td)
         # Isolate impd fully: give it a throwaway config + library dir so it never touches
         # ~/Music, ~/.config, etc. This also lets us set the opus bitrate.
@@ -439,31 +705,81 @@ def make_condensed(video: Path, timing_srt: Path, out_path: Path, meta: dict):
                     vprint(f"      cut [{mmss(s0)} → {mmss(e0)}]  {e0 - s0:4.1f}s")
         if proc.returncode != 0 or not raw.exists() or raw.stat().st_size == 0:
             raise RuntimeError("impd condense failed: " + ((proc.stdout or "") + (proc.stderr or ""))[-300:])
-        # Add metadata via stream copy (no re-encode), written atomically.
-        tmp_out = out_path.parent / (out_path.name + ".part.ogg")
-        tag = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
-               "-c", "copy", "-map_metadata", "-1"]
-        for k, v in meta.items():
-            if v:
-                tag += ["-metadata", f"{k}={v}"]
-        tag += [str(tmp_out)]
-        try:
-            cp = run(tag)
-        except BaseException:
-            tmp_out.unlink(missing_ok=True)
-            raise
-        if cp.returncode != 0:
-            tmp_out.unlink(missing_ok=True)
-            raise RuntimeError(f"tagging failed: {cp.stderr.strip()[:200]}")
-        os.replace(tmp_out, out_path)
+        _tag_and_place(raw, out_path, meta)
     size_mb = out_path.stat().st_size / 1e6 if out_path.exists() else 0
     vprint(f"    -> {out_path.name}  ({size_mb:.1f} MB)")
 
 
 # ---- ASR (anime-whisper) ---------------------------------------------------
-def extract_asr_audio(video: Path, wav: Path):
+_AUDIO_LANGS = {x.strip().lower() for x in AUDIO_LANG.split(",") if x.strip()}
+# Titles used for director's commentary and audio-description tracks. Never transcribe one.
+_COMMENTARY_RE = re.compile(r"(?i)comment|解説|audio\s*description|descriptive")
+
+
+def list_audio_streams(video: Path):
+    """Relative index, language, title and 'is this a commentary track' per audio stream."""
+    cp = run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+              "stream=index,codec_name,channels:stream_tags=language,title:"
+              "stream_disposition=comment,visual_impaired", "-of", "json", str(video)])
+    if cp.returncode != 0:
+        return []
+    try:
+        streams = json.loads(cp.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for rel, s in enumerate(streams):
+        tags = s.get("tags", {}) or {}
+        disp = s.get("disposition", {}) or {}
+        title = tags.get("title") or ""
+        out.append({
+            "rel": rel,
+            "lang": (tags.get("language") or "").lower(),
+            "title": title,
+            "commentary": bool(disp.get("comment") or disp.get("visual_impaired")
+                               or _COMMENTARY_RE.search(title)),
+        })
+    return out
+
+
+def pick_audio_stream(video: Path):
+    """(relative index for ffmpeg's 0:a:N, reason) — the track we should transcribe.
+
+    Dual-audio releases routinely list the English dub FIRST, so taking 0:a:0 blindly
+    transcribes the dub — which anime-whisper faithfully renders as katakana-ised English.
+    Prefer a Japanese-tagged stream; never pick a commentary or audio-description track;
+    fall back to the first stream when a release carries no language tags at all (which is
+    exactly the old behaviour, so single-track files are unaffected).
+
+    Deliberately simple: pick by language tag, not by a weighting table. Releases in the
+    wild break every other signal — a Kaijuu 8-gou encode marks BOTH its Japanese and
+    English tracks `default`, and plenty of rips carry no tags whatsoever.
+    """
+    if AUDIO_TRACK is not None:
+        return AUDIO_TRACK, "forced by JPSUBS_AUDIO_TRACK"
+    streams = list_audio_streams(video)
+    if not streams:
+        return 0, "no audio stream info"
+    usable = [s for s in streams if not s["commentary"]] or streams
+    preferred = [s for s in usable if s["lang"] in _AUDIO_LANGS]
+    if preferred:
+        why = preferred[0]["lang"]
+        if len(preferred) > 1:
+            why += f", first of {len(preferred)}"
+        if len(streams) > len(usable):
+            why += f", skipped {len(streams) - len(usable)} commentary"
+        return preferred[0]["rel"], why
+    if any(s["lang"] for s in streams):
+        tags = ", ".join(s["lang"] or "untagged" for s in streams)
+        return usable[0]["rel"], f"NO JAPANESE TRACK — only [{tags}]"
+    return usable[0]["rel"], "no language tags"
+
+
+def extract_asr_audio(video: Path, wav: Path, track=None):
+    if track is None:
+        track = pick_audio_stream(video)[0]
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(video), "-map", f"0:a:{AUDIO_TRACK}"]
+            "-i", str(video), "-map", f"0:a:{track}"]
     if DENOISE_FILTER:
         args += ["-af", DENOISE_FILTER]
     args += ["-ar", str(SR), "-ac", "1", "-c:a", "pcm_s16le", str(wav)]
@@ -525,14 +841,57 @@ def get_pipe():
             vprint(f"    Loading {MODEL_ID} on {device}...")
         else:
             vprint(f"    Downloading {MODEL_ID} (one-time, ~3 GB), then loading on {device}...")
-        _PIPE = pipeline("automatic-speech-recognition", model=MODEL_ID,
-                         device=device, dtype=dtype, chunk_length_s=30.0, batch_size=1)
+        kw = dict(model=MODEL_ID, device=device, chunk_length_s=30.0, batch_size=1)
+        try:
+            _PIPE = pipeline("automatic-speech-recognition", dtype=dtype, **kw)
+        except TypeError:
+            # transformers < 4.56 spells this torch_dtype; it became `dtype` later.
+            _PIPE = pipeline("automatic-speech-recognition", torch_dtype=dtype, **kw)
     return _PIPE
 
 
-def transcribe_span(pipe, audio, start, end):
-    a = max(0, int((start - SEG_PAD_S) * SR))
-    b = min(len(audio), int((end + SEG_PAD_S) * SR))
+def clamp_pads(spans, pad=SEG_PAD_S):
+    """Return [(start, end, lead_pad, trail_pad)] with the ASR padding clamped so that a
+    window never reaches into a neighbouring cue's speech.
+
+    Real subtitle releases often separate consecutive cues by only ~0.08 s. With a flat
+    0.2 s pad on each side, every one of those windows ran ~0.12 s past the next cue's
+    start, so anime-whisper heard — and duly transcribed — the first mora or two of the
+    next sentence onto the end of this line. The next line then began from its own second
+    word, because its window started after that audio had already gone by. Both halves
+    read as though a word had been shifted between them, e.g.
+
+        甘やかされたから。おや      <- 'おや' is the 親 that opens the NEXT line
+        親にも世間にもな。
+
+    The two sides are NOT treated alike, because they fail differently:
+
+      * Reaching FORWARD is what causes the bleed above, so the trailing pad only takes a
+        small share of the gap (TRAIL_GAP_SHARE). It still needs a little room, or a cue
+        that ends a hair early clips the last mora.
+      * Reaching BACKWARD is how the model hears a word's onset — clip that and the first
+        word degrades (もともと was heard as そもと when the lead pad was cut to 0.04 s).
+        The previous cue's speech has already ended by its own end time, so the lead pad
+        may safely take the WHOLE gap: it gains onset room without hearing the previous
+        line's words.
+
+    Consecutive windows may therefore share a sliver of the silence in the gap, which
+    costs nothing, but neither one reaches into the other's speech.
+    """
+    out = []
+    for i, (s, e) in enumerate(spans):
+        prev_end = spans[i - 1][1] if i else None
+        next_start = spans[i + 1][0] if i + 1 < len(spans) else None
+        lead = pad if prev_end is None else min(pad, max(0.0, s - prev_end))
+        trail = (pad if next_start is None else
+                 min(pad, max(0.0, (next_start - e) * TRAIL_GAP_SHARE)))
+        out.append((s, e, lead, trail))
+    return out
+
+
+def transcribe_span(pipe, audio, start, end, lead=SEG_PAD_S, trail=SEG_PAD_S):
+    a = max(0, int((start - lead) * SR))
+    b = min(len(audio), int((end + trail) * SR))
     if b <= a:
         return ""
     out = pipe({"raw": audio[a:b], "sampling_rate": SR},
@@ -604,7 +963,7 @@ def cleanup(entries):
 
 
 def write_srt(entries, path: Path):
-    tmp = path.parent / (path.name + ".part")  # atomic: write then rename
+    tmp = staging_path(path)  # atomic: write then rename
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             for i, e in enumerate(entries, 1):
@@ -616,19 +975,25 @@ def write_srt(entries, path: Path):
 
 
 def make_subtitles(video: Path, spans, out_path: Path):
-    with tempfile.TemporaryDirectory(prefix="subgen.asr.") as td:
+    with tempdir("subgen.asr.") as td:
         wav = Path(td) / "audio.wav"
+        track, why = pick_audio_stream(video)
         note = f"denoise {DENOISE_FILTER}" if DENOISE_FILTER else "no denoise"
-        vprint(f"    Extracting ASR audio (16kHz mono, {note})...")
-        extract_asr_audio(video, wav)
+        vprint(f"    Extracting ASR audio from 0:a:{track} ({why}); 16kHz mono, {note}...")
+        if "NO JAPANESE" in why:
+            # Worth saying even under --quiet: the transcript will be of the wrong language.
+            print(f"    WARNING: {video.name} has no Japanese audio track; "
+                  f"transcribing 0:a:{track} instead.")
+        extract_asr_audio(video, wav, track)
         audio = load_wav_f32(wav)
         spans = dedup_spans(spans)  # collapse overlapping karaoke/duplicate windows
+        windows = clamp_pads(spans)  # keep each window out of its neighbours' speech
         pipe = get_pipe()
         vprint("")  # separate the model-loading progress bar from the transcription
         vprint(f"    Transcribing {len(spans)} segments with anime-whisper:")
         entries = []
-        for start, end in spans:
-            text = transcribe_span(pipe, audio, start, end)
+        for start, end, lead, trail in windows:
+            text = transcribe_span(pipe, audio, start, end, lead, trail)
             entries.append({"start": start, "end": end, "text": text})
             if text:
                 vprint(f"      [{mmss(start)}] {text}")
@@ -656,8 +1021,16 @@ def process_one(video: Path, root: Path, skip_existing: bool, dry_run: bool,
     plan = (["condensed audio"] if do_cond else []) + (["subtitles"] if do_subs else [])
     vprint(f"    Will produce: {', '.join(plan)}")
 
+    # Fail early and legibly rather than deep inside ffmpeg with a bare "cannot find the
+    # path specified".
+    for label, target in (("subtitles", sub_out if do_subs else None),
+                          ("condensed audio", cond_out if do_cond else None)):
+        if target is not None and path_too_long(target):
+            print(f"    ERROR: cannot write {label} — {long_path_hint(target)}\n")
+            return "failed"
+
     try:
-        with tempfile.TemporaryDirectory(prefix="subgen.") as td:
+        with tempdir("subgen.") as td:
             work_srt = Path(td) / "timing.srt"
             source = obtain_timing_srt(video, work_srt)
             if source is None:
@@ -673,13 +1046,17 @@ def process_one(video: Path, root: Path, skip_existing: bool, dry_run: bool,
                 if do_cond:
                     vprint(f"    [dry-run] condensed audio -> {cond_out}")
                 if do_subs:
+                    track, why = pick_audio_stream(video)
+                    vprint(f"    [dry-run] ASR audio      -> 0:a:{track} ({why})")
+                    if "NO JAPANESE" in why:
+                        print(f"    WARNING: no Japanese audio track in {video.name}")
                     vprint(f"    [dry-run] subtitles      -> {sub_out}")
                 print(f"    [dry-run] from {len(spans)} segments\n")
                 return "ok"
 
             if do_cond:
                 vprint("")
-                vprint("    Condensing with impd...")
+                vprint(f"    Condensing with {which_condenser()}...")
                 cond_out.parent.mkdir(parents=True, exist_ok=True)
                 make_condensed(video, work_srt, cond_out, gather_metadata(video, root))
             if do_subs:
@@ -714,12 +1091,23 @@ def collect_videos(directory: Path):
 def check_tools():
     missing = [t for t in ("ffmpeg", "ffprobe") if not shutil.which(t)]
     if missing:
-        sys.exit(f"Error: {' and '.join(missing)} not found on PATH. "
-                 "Install ffmpeg — see https://ffmpeg.org/download.html")
+        hint = "Install ffmpeg — see https://ffmpeg.org/download.html"
+        if sys.platform == "win32":
+            hint = ("Install it with:  winget install Gyan.FFmpeg\n"
+                    "then open a NEW terminal — winget's PATH change does not reach "
+                    "shells that are already running.")
+        sys.exit(f"Error: {' and '.join(missing)} not found on PATH.\n{hint}")
+
+
+def clean_arg_path(s: str) -> str:
+    """Windows shells hand us `C:\\Library"` when the user tab-completes a directory and
+    types `"C:\\Library\\"` — the trailing backslash escapes the closing quote. A double
+    quote is not a legal character in a Windows path, so stripping it is always safe."""
+    return s.rstrip('"') if sys.platform == "win32" else s
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, COND_ROOT
     ap = argparse.ArgumentParser(description="Condensed audio + Japanese subtitles from sub-timed audio (anime-whisper)")
     ap.add_argument("inputs", nargs="+", help="video file(s), or a directory with --batch")
     ap.add_argument("--batch", action="store_true", help="treat the single argument as a directory")
@@ -727,7 +1115,13 @@ def main():
     ap.add_argument("--no-subs", action="store_true", help="skip subtitle generation")
     ap.add_argument("--no-condensed", action="store_true", help="skip condensed-audio generation")
     ap.add_argument("--quiet", action="store_true", help="less verbose output")
+    ap.add_argument("--condensed-dir", metavar="DIR",
+                    help="where condensed audio goes; <DIR>/<series>/Condensed Audio/ "
+                         "(default: your Music folder, so media servers don't index it)")
     args = ap.parse_args()
+    if args.condensed_dir:
+        COND_ROOT = clean_arg_path(args.condensed_dir)
+    args.inputs = [clean_arg_path(s) for s in args.inputs]
 
     VERBOSE = not args.quiet
     want_subs = not args.no_subs
